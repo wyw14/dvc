@@ -49,6 +49,60 @@ def _adapt_path_from_entry(entry: "DataIndexEntry") -> str:
     return os.sep.join(key)
 
 
+def _is_broken_link(path: "Union[str, os.PathLike[str]]") -> bool:
+    """Return True if *path* is a symlink that does not resolve to an existing target."""
+    try:
+        return os.path.islink(path) and not os.path.exists(path)
+    except OSError:
+        return False
+
+
+def _dedupe_by_realpath(
+    paths: list[str], root: "Union[str, os.PathLike[str]]"
+) -> list[str]:
+    """Drop logical paths that resolve to the same physical file, keeping the first.
+
+    Paths that do not exist on disk are compared by their logical key and left
+    untouched. Order is preserved.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in paths:
+        physical = os.path.join(root, path)
+        try:
+            identity = (
+                os.path.realpath(physical)
+                if os.path.lexists(physical)
+                else path
+            )
+        except OSError:
+            identity = path
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(path)
+    return result
+
+
+def _reclassify_broken_links(
+    changes: "DiffResult", root: "Union[str, os.PathLike[str]]"
+) -> "DiffResult":
+    """Move dangling symlinks out of add/modify/delete buckets into ``unknown``."""
+    broken: list[str] = list(changes.get("unknown", []))
+    for state in ("added", "modified", "deleted"):
+        remaining: list[str] = []
+        for path in changes.get(state, []):
+            physical = os.path.join(root, path.rstrip(os.path.sep))
+            if _is_broken_link(physical):
+                if path not in broken:
+                    broken.append(path)
+            else:
+                remaining.append(path)
+        changes[state] = remaining
+    changes["unknown"] = broken
+    return changes
+
+
 def _get_missing_paths(
     to_check: Mapping["FileSystem", Mapping[str, Iterable["DataIndexEntry"]]],
     batch_size: Optional[int] = None,
@@ -306,7 +360,7 @@ def _diff_index_to_wtree(
     ) as pb:
         index = repo.index.data["repo"]
         view = filter_index(index, filter_keys=filter_keys)
-        return _diff(
+        result = _diff(
             view,
             workspace_view,
             filter_keys=filter_keys,
@@ -316,6 +370,14 @@ def _diff_index_to_wtree(
             batch_size=batch_size,
             callback=pb.as_callback(),
         )
+
+    # Symlinks or directory renames can expose one object via several logical
+    # paths; collapse those and separate broken links from real deletions.
+    for state in ("added", "modified", "unknown"):
+        if result.get(state):
+            result[state] = _dedupe_by_realpath(result[state], repo.root_dir)
+    _reclassify_broken_links(result, repo.root_dir)
+    return result
 
 
 def _diff_head_to_index(
