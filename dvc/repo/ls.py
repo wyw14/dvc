@@ -1,8 +1,13 @@
 import os
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+from dvc.fs.paginate import Entries
+from dvc.log import logger
+
 if TYPE_CHECKING:
     from dvc.fs.dvc import DVCFileSystem
+
+logger = logger.getChild(__name__)
 
 
 def _open_repo(
@@ -104,22 +109,15 @@ def ls_tree(
         )
 
 
-def _ls(
-    fs: "DVCFileSystem",
-    path: str,
-    recursive: Optional[bool] = None,
-    dvc_only: bool = False,
-    maxdepth: Optional[int] = None,
-):
-    fs_path = fs.info(path)["name"]
+def _collect_infos(fs, fs_path, recursive, dvc_only, maxdepth):
+    """Walk ``fs_path``, returning entries keyed by relative path.
 
-    infos = {}
-
-    # ignore maxdepth only if recursive is not set
-    maxdepth = maxdepth if recursive else None
-    if maxdepth == 0 or fs.isfile(fs_path):
-        infos[os.path.basename(path) or os.curdir] = fs.info(fs_path)
-    else:
+    Returns ``(infos, failure)``; ``failure`` is set when the traversal broke
+    after one or more levels had been confirmed. A failure before any entry
+    is confirmed is re-raised in its original form.
+    """
+    infos: dict[str, Any] = {}
+    try:
         for root, dirs, files in fs.walk(
             fs_path,
             dvcfiles=True,
@@ -138,12 +136,46 @@ def _ls(
 
             if not recursive:
                 break
+    except OSError as exc:
+        if not infos:
+            raise
+        logger.warning(
+            "Listing of '%s' is incomplete (%s); %d confirmed entr%s "
+            "retained, the remote may contain more",
+            fs_path,
+            exc,
+            len(infos),
+            "y" if len(infos) == 1 else "ies",
+        )
+        return infos, exc
+    return infos, None
 
-    ret_list = []
+
+def _ls(
+    fs: "DVCFileSystem",
+    path: str,
+    recursive: Optional[bool] = None,
+    dvc_only: bool = False,
+    maxdepth: Optional[int] = None,
+):
+    fs_path = fs.info(path)["name"]
+
+    # ignore maxdepth only if recursive is not set
+    maxdepth = maxdepth if recursive else None
+    if maxdepth == 0 or fs.isfile(fs_path):
+        infos = {os.path.basename(path) or os.curdir: fs.info(fs_path)}
+        failure = None
+    else:
+        infos, failure = _collect_infos(fs, fs_path, recursive, dvc_only, maxdepth)
+
+    ret_list = Entries()
     for p, info in sorted(infos.items(), key=lambda x: x[0]):
         _info = _adapt_info(info)
         _info["path"] = p
         ret_list.append(_info)
+    if failure is not None:
+        ret_list.incomplete = True
+        ret_list.error = failure
     return ret_list
 
 
@@ -166,9 +198,19 @@ def _ls_tree(fs, path, maxdepth=None, _info=None, **fs_kwargs):
     if recurse and info["type"] == "directory":
         try:
             infos = fs.ls(path, detail=True, **fs_kwargs)
-        except FileNotFoundError:
-            # broken symlink?
-            infos = []
+        except FileNotFoundError as exc:
+            # broken symlink or a listing that failed mid-traversal: do not
+            # pretend the directory contents are an empty/complete listing,
+            # mark this subtree as incomplete while keeping confirmed siblings
+            logger.warning(
+                "Listing of '%s' is incomplete (%s); confirmed entries are "
+                "retained, the remote may contain more",
+                path,
+                exc,
+            )
+            ls_info["incomplete"] = True
+            ret[name] = ls_info
+            return ret
 
         infos.sort(key=lambda f: f["name"])
         maxdepth = maxdepth - 1 if maxdepth is not None else None

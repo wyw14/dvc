@@ -375,10 +375,7 @@ class _DVCFileSystem(AbstractFileSystem):
         except FileNotFoundError:
             return False
 
-    def ls(self, path, detail=True, dvc_only=False, **kwargs):  # noqa: C901, PLR0912
-        key = self._get_key_from_relative(path)
-        repo, dvc_fs, subkey = self._get_subrepo_info(key)
-
+    def _ls_dvc_infos(self, dvc_fs, subkey):
         dvc_infos = {}
         dvc_info = {}
         if dvc_fs:
@@ -390,24 +387,60 @@ class _DVCFileSystem(AbstractFileSystem):
                 else:
                     for info in dvc_fs.ls(dvc_path, detail=True):
                         dvc_infos[dvc_fs.name(info["name"])] = info
+        return dvc_info, dvc_infos
+
+    def _ls_workspace_infos(self, repo, key, ignore_subrepos):
+        fs_infos: dict[str, Any] = {}
+        fs_info: dict[str, Any] = {}
+        fs = self.repo.fs
+        fs_path = self._from_key(key)
+        try:
+            fs_info = fs.info(fs_path)
+        except (FileNotFoundError, NotADirectoryError):
+            return fs_info, fs_infos
+
+        if fs_info["type"] == "file":
+            fs_infos[""] = fs_info
+            return fs_info, fs_infos
+
+        try:
+            entries = iter(
+                repo.dvcignore.ls(
+                    fs,
+                    fs_path,
+                    detail=True,
+                    ignore_subrepos=ignore_subrepos,
+                )
+            )
+            while True:
+                try:
+                    entry = next(entries)
+                except StopIteration:
+                    break
+                except (FileNotFoundError, NotADirectoryError):
+                    # listing broke after yielding some entries: surface the
+                    # failure instead of presenting a partial listing as
+                    # complete; confirmed entries stay in fs_infos
+                    if fs_infos:
+                        raise
+                    break
+                fs_infos[fs.name(entry["name"])] = entry
+        except (FileNotFoundError, NotADirectoryError):
+            # directory raced away right after info() succeeded
+            pass
+        return fs_info, fs_infos
+
+    def ls(self, path, detail=True, dvc_only=False, **kwargs):
+        key = self._get_key_from_relative(path)
+        repo, dvc_fs, subkey = self._get_subrepo_info(key)
+
+        dvc_info, dvc_infos = self._ls_dvc_infos(dvc_fs, subkey)
 
         fs_infos = {}
         fs_info = {}
         ignore_subrepos = kwargs.get("ignore_subrepos", True)
         if not dvc_only:
-            fs = self.repo.fs
-            fs_path = self._from_key(key)
-            try:
-                fs_info = fs.info(fs_path)
-                if fs_info["type"] == "file":
-                    fs_infos[""] = fs_info
-                else:
-                    for info in repo.dvcignore.ls(
-                        fs, fs_path, detail=True, ignore_subrepos=ignore_subrepos
-                    ):
-                        fs_infos[fs.name(info["name"])] = info
-            except (FileNotFoundError, NotADirectoryError):
-                pass
+            fs_info, fs_infos = self._ls_workspace_infos(repo, key, ignore_subrepos)
 
         if not (fs_info or dvc_info):
             # broken symlink or TreeError
